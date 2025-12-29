@@ -298,7 +298,7 @@ def profle_svdllm(name, model, calib_loader, dev):
         layers = model.model.layers
     elif "opt" in name:
         layers = model.model.decoder.layers
-    # model = model.to(dev)
+    model = model.to(dev)
     print("Start obtaining the whitening matrix...")
     def hook(module, input, output):
         inp = input[0].detach().float()
@@ -364,7 +364,7 @@ def get_h(name, model, calib_loader, dev):
         layers = model.model.layers
     elif "opt" in name:
         layers = model.model.decoder.layers
-    # model = model.to(dev)
+    model = model.to(dev)
     print("Start obtaining the whitening matrix...")
     def hook(module, input, output):
         inp = input[0].detach().float()
@@ -1206,7 +1206,7 @@ if __name__ == '__main__':
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
     
     # parser.add_argument('--profiling_mat_path', type=str, default=None, help='Local path to load the profiling matrices`')
-    parser.add_argument('--h_mat_path', type=str, default='compressed_models/Llama-13b_svdllm_wikitext2_256_3.pt', help='Local path to load the h matrices`')
+    parser.add_argument('--h_mat_path', type=str, default=None, help='Local path to load the h matrices`')
     parser.add_argument('--seed',type=int, default=3, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -1219,7 +1219,7 @@ if __name__ == '__main__':
     parser.add_argument('--t', type=float, default=0.2, help='temperature for layer compression ratio')
     parser.add_argument('--matrices_optimized', action='store_true', default=True, help='whether to optimize matrices compression ratio')
     parser.add_argument('--trunc_rank_method', type=str, default='cos', choices=['average','cos'], help='way to cal compression ratio of each module')
-    parser.add_argument('--save_path', type=str, default='compressed_models', help='the path to save the compressed model checkpoints.`')
+    parser.add_argument('--save_path', type=str, default='profiles', help='the path to save the compressed model checkpoints.`')
     parser.add_argument('--data_preparation', action='store_true', default=False)
     parser.add_argument('--cuda_devices', type=str, default='0,1', help='the cuda devices to run the model')
     
@@ -1348,7 +1348,7 @@ if __name__ == '__main__':
             ppl_eval(model, tokenizer, datasets=['wikitext2', 'c4'], model_seq_len=args.model_seq_len, batch_size=args.eval_batch_size, device=args.DEV)
         if args.eval_zero_shot:
             accelerate=False if torch.cuda.device_count() == 1 else True
-            task_list = ["hellaswag", "winogrande", "arc_easy", "openbookqa", "piqa", "mathqa"]
+            task_list = ["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa", "mathqa", "piqa"]
             num_shot = 0
             results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
             print("zero_shot evaluation results")
@@ -1358,7 +1358,7 @@ if __name__ == '__main__':
             model.save_pretrained(args.save_path)
             tokenizer.save_pretrained(args.save_path)
     elif args.step == 0:
-        model, tokenizer = get_model_from_huggingface(model_id=args.model, device_map='cpu')
+        model, tokenizer = get_model_from_huggingface(model_id=args.model, device_map=None)
         model = model.eval()
         if args.h_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)

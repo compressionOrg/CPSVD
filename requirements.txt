@@ -28,7 +28,7 @@ exceptiongroup==1.2.2
 filelock==3.18.0
 fonttools==4.55.3
 frozenlist==1.5.0
-fsspec==2025.7.0
+# fsspec==2025.7.0
 gitdb==4.0.11
 GitPython==3.1.43
 h11==0.14.0
@@ -43,7 +43,7 @@ jiter==0.8.2
 joblib==1.4.2
 jsonlines==4.0.0
 kiwisolver==1.4.7
--e git+https://github.com/locuslab/wanda.git@8e8fc87b4a2f9955baa7e76e64d5fce7fa8724a6#egg=lm_eval&subdirectory=lm-evaluation-harness
+# -e git+https://github.com/locuslab/wanda.git@8e8fc87b4a2f9955baa7e76e64d5fce7fa8724a6#egg=lm_eval&subdirectory=lm-evaluation-harness
 lxml==5.3.1
 MarkupSafe==3.0.2
 matplotlib==3.9.4

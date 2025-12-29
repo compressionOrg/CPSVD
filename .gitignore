@@ -11,3 +11,4 @@ my_3d_importance_plots/
 scripts/
 wikitext/
 *.pt
+logs
