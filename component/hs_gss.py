@@ -70,6 +70,8 @@ class SchattenShrinkageOperator:
         
         方程: σ_new + (2/3)·λ·σ_new^(-1/3) = σ_old
         变换为三次方程后使用 Cardan 公式求解
+        
+        注意：为数值稳定性，使用简化的软阈值近似
         """
         p = 2.0 / 3.0
         coeff = lambda_val * p  # (2/3)·λ
@@ -83,23 +85,35 @@ class SchattenShrinkageOperator:
         mask = sigma > threshold
         
         if mask.any():
-            s = sigma[mask]
+            s = sigma[mask].clone()
             
-            # Cardan 公式参数
-            # 三次方程: t³ - s·t + coeff = 0
-            q = -coeff
-            r = s / 2.0
+            # 使用数值稳定的迭代方法代替 Cardan 公式
+            # 初始估计：软阈值
+            x = torch.clamp(s - lambda_val, min=1e-8)
             
-            # 判别式
-            discriminant = r**2 + q**3
+            # 几次牛顿迭代来精化
+            for _ in range(10):
+                x_safe = torch.clamp(x, min=1e-10)
+                # f(x) = x + coeff * x^(-1/3) - s = 0
+                # 使用 x^(p-1) = x^(-1/3)
+                x_pow = torch.pow(x_safe, p - 1)  # x^(-1/3)
+                f = x + coeff * x_pow - s
+                # f'(x) = 1 + coeff * (p-1) * x^(p-2) = 1 - coeff/3 * x^(-4/3)
+                df = 1.0 + coeff * (p - 1) * torch.pow(x_safe, p - 2)
+                df = torch.clamp(df, min=0.1)  # 避免除以太小的值
+                
+                x_new = x - f / df
+                x_new = torch.clamp(x_new, min=0.0)
+                
+                # 检查收敛
+                if torch.max(torch.abs(x_new - x)) < 1e-6:
+                    break
+                x = x_new
             
-            # 使用稳定的 Cardan 公式
-            # t = cbrt(r + sqrt(Δ)) + cbrt(r - sqrt(Δ))
-            sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
-            cbrt1 = torch.sign(r + sqrt_disc) * torch.abs(r + sqrt_disc) ** (1/3)
-            cbrt2 = torch.sign(r - sqrt_disc) * torch.abs(r - sqrt_disc) ** (1/3)
-            
-            sigma_new[mask] = cbrt1 + cbrt2
+            # 最终检查：确保结果有效
+            x = torch.clamp(x, min=0.0)
+            x = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+            sigma_new[mask] = x
         
         return sigma_new
     
@@ -169,13 +183,24 @@ class HessianWhitening:
             H_sqrt: H^(1/2) 用于后续逆变换 [in_dim, in_dim]
         """
         # 确保 H 在与 W 相同的设备上
-        H = H.to(W.device)
+        H = H.to(W.device).float()
+        W = W.float()
         
         # 确保 H 是对称正定的
         H = (H + H.T) / 2.0
         
+        # 处理零 Hessian 的情况（没有样本通过该层）
+        diag_H = torch.diag(H)
+        if diag_H.max() < 1e-10:
+            # H 接近零，返回单位变换
+            n = H.size(0)
+            H_sqrt = torch.eye(n, device=H.device, dtype=H.dtype)
+            return W, H_sqrt
+        
         # 添加阻尼以确保正定性
-        damp_val = damp * torch.mean(torch.diag(H))
+        # 使用更稳健的阻尼值计算
+        diag_mean = torch.mean(torch.abs(diag_H))
+        damp_val = max(damp * diag_mean.item(), 1e-6)
         n = H.size(0)
         idx = torch.arange(n, device=H.device)
         H_damped = H.clone()
@@ -186,12 +211,28 @@ class HessianWhitening:
             H_sqrt = torch.linalg.cholesky(H_damped)
         except RuntimeError:
             # 如果 Cholesky 失败，使用特征分解
-            eigenvalues, eigenvectors = torch.linalg.eigh(H_damped)
-            eigenvalues = torch.clamp(eigenvalues, min=1e-6)
-            H_sqrt = eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ eigenvectors.T
+            try:
+                eigenvalues, eigenvectors = torch.linalg.eigh(H_damped)
+                eigenvalues = torch.clamp(eigenvalues, min=1e-6)
+                H_sqrt = eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ eigenvectors.T
+            except RuntimeError:
+                # 最后的保底：使用单位矩阵
+                print("Warning: Both Cholesky and eigen decomposition failed, using identity")
+                H_sqrt = torch.eye(n, device=H.device, dtype=H.dtype)
+        
+        # 检查 H_sqrt 的有效性
+        if not torch.isfinite(H_sqrt).all():
+            print("Warning: H_sqrt contains non-finite values, using identity")
+            H_sqrt = torch.eye(n, device=H.device, dtype=H.dtype)
         
         # 白化变换
         W_whitened = W @ H_sqrt
+        
+        # 检查白化结果的有效性
+        if not torch.isfinite(W_whitened).all():
+            print("Warning: W_whitened contains non-finite values, skipping whitening")
+            H_sqrt = torch.eye(n, device=H.device, dtype=H.dtype)
+            W_whitened = W
         
         return W_whitened, H_sqrt
     
@@ -215,9 +256,27 @@ class HessianWhitening:
         Returns:
             Vt_final: 原始空间的 V'^T [rank, in_dim]，满足 W' = U @ Σ' @ Vt_final
         """
-        H_sqrt_inv = torch.linalg.inv(H_sqrt)
-        # Vt @ H^(-1/2): [rank, in_dim] @ [in_dim, in_dim] = [rank, in_dim]
-        Vt_final = Vt @ H_sqrt_inv
+        try:
+            # 尝试使用 solve 而不是直接求逆，更稳定
+            # Vt @ H^(-1/2) = solve(H^(1/2)^T, Vt^T)^T
+            Vt_final = torch.linalg.solve(H_sqrt.T, Vt.T).T
+        except RuntimeError:
+            # 如果 solve 失败，使用伪逆
+            try:
+                H_sqrt_inv = torch.linalg.pinv(H_sqrt)
+            except RuntimeError:
+                # 最后的保底：使用带正则化的逆
+                n = H_sqrt.size(0)
+                reg = 1e-4 * torch.eye(n, device=H_sqrt.device, dtype=H_sqrt.dtype)
+                H_sqrt_inv = torch.linalg.inv(H_sqrt + reg)
+            Vt_final = Vt @ H_sqrt_inv
+        
+        # 检查结果的有效性
+        if not torch.isfinite(Vt_final).all():
+            # 如果结果包含 NaN/Inf，回退到不做逆白化
+            print("Warning: unwhiten produced non-finite values, falling back to identity")
+            Vt_final = Vt.clone()
+        
         return Vt_final
 
 

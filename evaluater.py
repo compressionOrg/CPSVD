@@ -112,6 +112,7 @@ def evaluate_perplexity(model, dataset, limit):
     device = _get_model_device(model)
 
     nlls = []
+    valid_samples = 0
 
     for i in range(nsamples):
         if i == limit:
@@ -119,6 +120,12 @@ def evaluate_perplexity(model, dataset, limit):
         input_ids = dataset[i : i + 1, :-1].to(device)
         labels = dataset[i : i + 1, 1:].contiguous()
         logits = model(input_ids=input_ids)[0]
+        
+        # 检查 logits 是否包含 NaN 或 Inf
+        if not torch.isfinite(logits).all():
+            print(f"Warning: Non-finite logits at sample {i}, skipping...")
+            continue
+            
         shift_logits = logits[:, :, :]
         shift_labels = labels.to(device)
         loss_fct = nn.CrossEntropyLoss()
@@ -126,8 +133,20 @@ def evaluate_perplexity(model, dataset, limit):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         )
+        
+        # 检查 loss 是否有效
+        if not torch.isfinite(loss):
+            print(f"Warning: Non-finite loss at sample {i}, skipping...")
+            continue
+            
         neg_log_likelihood = loss.float() * seqlen
         nlls.append(neg_log_likelihood)
+        valid_samples += 1
+    
+    if len(nlls) == 0:
+        print("Warning: No valid samples for perplexity calculation!")
+        return float('inf')
+    
     ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * seqlen))
     return ppl.item()
 

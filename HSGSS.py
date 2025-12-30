@@ -114,7 +114,15 @@ def collect_hessian_matrices(model, calib_loader, dev, model_name):
         for full_name, module in layers[i].named_modules():
             if isinstance(module, nn.Linear) and hasattr(module, 'raw_hessian'):
                 # 规范化名称：self_attn.q_proj, mlp.gate_proj 等
-                layer_h[full_name] = module.raw_hessian.cpu()
+                raw_h = module.raw_hessian
+                # 检查 Hessian 是否有效
+                if isinstance(raw_h, torch.Tensor) and raw_h.numel() > 0:
+                    layer_h[full_name] = raw_h.cpu()
+                else:
+                    # 如果 Hessian 是标量 0 或无效，使用单位矩阵
+                    in_dim = module.weight.shape[1]
+                    print(f"Warning: Invalid Hessian for layer {i}.{full_name}, using identity")
+                    layer_h[full_name] = torch.eye(in_dim)
                 del module.raw_hessian
         
         h_mat[i] = layer_h
@@ -201,6 +209,12 @@ def compress_model_with_hsgss(model, h_mat, args):
     for global_name, W in tqdm(all_weights.items(), desc="Whitening & SVD"):
         H = all_hessians[global_name]
         
+        # 检查 Hessian 的有效性
+        if isinstance(H, (int, float)) and H == 0:
+            # Hessian 是标量0，使用单位矩阵
+            in_dim = W.shape[1]
+            H = torch.eye(in_dim)
+        
         # 将数据移动到GPU进行计算
         W_gpu = W.float().to(compute_device)
         H_gpu = H.float().to(compute_device)
@@ -208,8 +222,26 @@ def compress_model_with_hsgss(model, h_mat, args):
         # 白化（在GPU上）
         W_whitened, H_sqrt = compressor.whitening.whiten(W_gpu, H_gpu, compressor.damp)
         
+        # 检查白化结果
+        if not torch.isfinite(W_whitened).all():
+            print(f"Warning: Non-finite values in whitened weights for {global_name}")
+            W_whitened = W_gpu
+            H_sqrt = torch.eye(W.shape[1], device=compute_device, dtype=W_gpu.dtype)
+        
         # SVD（在GPU上）
-        U, S, Vt = torch.linalg.svd(W_whitened, full_matrices=False)
+        try:
+            U, S, Vt = torch.linalg.svd(W_whitened, full_matrices=False)
+        except RuntimeError as e:
+            print(f"Warning: SVD failed for {global_name}: {e}, using fallback")
+            # 回退：不做白化，直接对原始权重做 SVD
+            U, S, Vt = torch.linalg.svd(W_gpu, full_matrices=False)
+            H_sqrt = torch.eye(W.shape[1], device=compute_device, dtype=W_gpu.dtype)
+        
+        # 检查 SVD 结果
+        if not torch.isfinite(U).all() or not torch.isfinite(S).all() or not torch.isfinite(Vt).all():
+            print(f"Warning: Non-finite SVD results for {global_name}, using fallback")
+            U, S, Vt = torch.linalg.svd(W_gpu, full_matrices=False)
+            H_sqrt = torch.eye(W.shape[1], device=compute_device, dtype=W_gpu.dtype)
         
         # 立即将结果移回CPU，释放GPU内存
         global_sigma_dict[global_name] = S.cpu()
@@ -263,18 +295,36 @@ def compress_model_with_hsgss(model, h_mat, args):
         
         # 应用收缩（使用等效lambda）
         S_new = compressor.shrinkage_op.shrink(S_old, effective_lambda)
+        
+        # 确保奇异值是有效的正数
+        S_new = torch.clamp(S_new, min=0.0)
+        S_new = torch.where(torch.isfinite(S_new), S_new, torch.zeros_like(S_new))
+        
         rank = torch.sum(S_new > 1e-8).item()
         
         if rank > 0:
-            U_trunc = U[:, :rank]
-            S_trunc = S_new[:rank]
-            Vt_trunc = Vt[:rank, :]
+            U_trunc = U[:, :rank].clone()
+            S_trunc = S_new[:rank].clone()
+            Vt_trunc = Vt[:rank, :].clone()
+            
+            # 检查 SVD 分量的有效性
+            if not torch.isfinite(U_trunc).all() or not torch.isfinite(Vt_trunc).all():
+                print(f"Warning: Non-finite values in SVD components for {global_name}")
+                global_compressed[global_name] = None
+                del global_whitened_svd[global_name]
+                del global_h_sqrt_dict[global_name]
+                continue
             
             # 逆白化（在GPU上完成，然后移回CPU）
-            Vt_trunc_gpu = Vt_trunc.to(compute_device)
-            H_sqrt_gpu = H_sqrt.to(compute_device)
+            Vt_trunc_gpu = Vt_trunc.float().to(compute_device)
+            H_sqrt_gpu = H_sqrt.float().to(compute_device)
             Vt_final_gpu = compressor.whitening.unwhiten(Vt_trunc_gpu, H_sqrt_gpu)
             Vt_final = Vt_final_gpu.cpu()
+            
+            # 检查逆白化结果的有效性
+            if not torch.isfinite(Vt_final).all():
+                print(f"Warning: Non-finite values after unwhitening for {global_name}, using original Vt")
+                Vt_final = Vt_trunc.cpu()
             
             # 清理
             del Vt_trunc_gpu, H_sqrt_gpu, Vt_final_gpu
@@ -383,11 +433,26 @@ def replace_modules_in_layer(layer, compressed_modules, args, layer_idx=0):
                     u_proj = nn.Linear(rank, out_dim, bias=False)
                     
                     # nn.Linear weight shape: [out_features, in_features]
-                    sqrt_S = torch.sqrt(torch.diag(S))
+                    # 确保 S 是正数且有效
+                    S_safe = torch.clamp(S, min=1e-8)
+                    S_safe = torch.where(torch.isfinite(S_safe), S_safe, torch.ones_like(S_safe) * 1e-8)
+                    sqrt_S = torch.sqrt(S_safe)
+                    sqrt_S_diag = torch.diag(sqrt_S)
+                    
                     # v_proj.weight: [rank, in_dim] = sqrt(S) @ Vt
-                    v_proj.weight.data = (sqrt_S @ Vt).to(dtype=original_dtype, device=original_device)
+                    v_weight = sqrt_S_diag @ Vt
                     # u_proj.weight: [out_dim, rank] = U @ sqrt(S)
-                    u_proj.weight.data = (U @ sqrt_S).to(dtype=original_dtype, device=original_device)
+                    u_weight = U @ sqrt_S_diag
+                    
+                    # 检查数值有效性
+                    if not torch.isfinite(v_weight).all() or not torch.isfinite(u_weight).all():
+                        print(f"Warning: Non-finite values in {module_name}, using identity fallback")
+                        # 回退到近似恒等映射
+                        v_weight = Vt.clone()
+                        u_weight = U.clone()
+                    
+                    v_proj.weight.data = v_weight.to(dtype=original_dtype, device=original_device)
+                    u_proj.weight.data = u_weight.to(dtype=original_dtype, device=original_device)
                     
                     # 移动到正确设备和dtype
                     v_proj = v_proj.to(dtype=original_dtype, device=original_device)
@@ -428,11 +493,25 @@ def replace_modules_in_layer(layer, compressed_modules, args, layer_idx=0):
                     v_proj = nn.Linear(in_dim, rank, bias=False)
                     u_proj = nn.Linear(rank, out_dim, bias=False)
                     
-                    sqrt_S = torch.sqrt(torch.diag(S))
+                    # 确保 S 是正数且有效
+                    S_safe = torch.clamp(S, min=1e-8)
+                    S_safe = torch.where(torch.isfinite(S_safe), S_safe, torch.ones_like(S_safe) * 1e-8)
+                    sqrt_S = torch.sqrt(S_safe)
+                    sqrt_S_diag = torch.diag(sqrt_S)
+                    
                     # v_proj.weight: [rank, in_dim] = sqrt(S) @ Vt
-                    v_proj.weight.data = (sqrt_S @ Vt).to(dtype=original_dtype, device=original_device)
-                    # u_proj.weight: [out_dim, rank] = U @ sqrt(S) (无转置!)
-                    u_proj.weight.data = (U @ sqrt_S).to(dtype=original_dtype, device=original_device)
+                    v_weight = sqrt_S_diag @ Vt
+                    # u_proj.weight: [out_dim, rank] = U @ sqrt(S)
+                    u_weight = U @ sqrt_S_diag
+                    
+                    # 检查数值有效性
+                    if not torch.isfinite(v_weight).all() or not torch.isfinite(u_weight).all():
+                        print(f"Warning: Non-finite values in {module_name}, using identity fallback")
+                        v_weight = Vt.clone()
+                        u_weight = U.clone()
+                    
+                    v_proj.weight.data = v_weight.to(dtype=original_dtype, device=original_device)
+                    u_proj.weight.data = u_weight.to(dtype=original_dtype, device=original_device)
                     
                     # 移动到正确设备和dtype
                     v_proj = v_proj.to(dtype=original_dtype, device=original_device)
