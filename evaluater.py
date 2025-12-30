@@ -9,9 +9,88 @@ import sys
 import fnmatch
 import torch.nn as nn
 
+from lm_eval.base import BaseLM
+from lm_eval import evaluator
+
 current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
+
+class EvalLM(BaseLM):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        device="cuda:0",
+        batch_size=1,
+    ):
+        super().__init__()
+
+        # assert isinstance(device, str)
+        assert isinstance(batch_size, int)
+
+        # self.model = model.to(self.device)
+        self.model = model
+        self.model.eval()
+
+        self._device = self.model.device 
+
+        self.tokenizer = tokenizer
+
+        self.vocab_size = self.tokenizer.vocab_size
+
+        self.batch_size_per_gpu = batch_size  # todo: adaptive batch size
+
+        self.seqlen = 2048
+
+    @property
+    def eot_token_id(self):
+        # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
+        return self.tokenizer.eos_token_id
+
+    @property
+    def max_length(self):
+        try:
+            return self.model.config.n_ctx
+        except AttributeError:
+            # gptneoconfig doesn't have n_ctx apparently
+            return self.model.config.max_position_embeddings
+
+    @property
+    def max_gen_toks(self):
+        return 256
+
+    @property
+    def batch_size(self):
+        # TODO: fix multi-gpu
+        return self.batch_size_per_gpu  # * gpus
+
+    @property
+    def device(self):
+        # TODO: fix multi-gpu
+        return self._device
+
+    def tok_encode(self, string: str):
+        return self.tokenizer.encode(string, add_special_tokens=False)
+    
+    def tok_decode(self, tokens):
+        return self.tokenizer.decode(tokens)
+
+    def _model_call(self, inps):
+        """
+        inps: a torch tensor of shape [batch, sequence]
+        the size of sequence may vary from call to call
+
+        returns: a torch tensor of shape [batch, sequence, vocab] with the
+        logits returned from the model
+        """
+        with torch.no_grad():
+            return self.model(inps)[0][:, :, :self.vocab_size]
+
+    def _model_generate(self, context, max_length, eos_token_id):
+        return self.model.generate(context, max_length=max_length, eos_token_id=eos_token_id, do_sample=False)
+
+
 
 @torch.no_grad()
 def evaluate_perplexity(model, dataset, limit):
@@ -193,37 +272,85 @@ def eff_eval(model, tokenizer, dataset='wikitext2', original_len=4, generated_le
         
 
 @torch.no_grad()
-def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"], 
-        num_fewshot=0, use_accelerate=False, add_special_tokens=False):
-    from lm_eval import tasks, evaluator 
-    def pattern_match(patterns, source_list):
-        task_names = set()
-        for pattern in patterns:
-            for matching in fnmatch.filter(source_list, pattern):
-                task_names.add(matching)
-        return list(task_names)
-    task_names = pattern_match(task_list, tasks.ALL_TASKS)
-    model_args = f"pretrained={model_name},cache_dir=./llm_weights"
-    limit = None 
-    if "70b" in model_name or "65b" in model_name:
-        limit = 2000
-    if use_accelerate:
-        model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
-    results = evaluator.simple_evaluate(
-        model="hf-causal-experimental",
-        model_args=model_args,
-        tasks=task_names,
-        num_fewshot=num_fewshot,
-        batch_size=None,
-        device=None,
-        no_cache=True,
-        limit=limit,
-        description_dict={},
-        decontamination_ngrams_path=None,
-        check_integrity=False,
-        pretrained_model=model,
-        tokenizer=tokenizer, 
-        add_special_tokens=add_special_tokens
-    )
+def zeroshot_eval(
+    model,
+    tokenizer,
+    tasks,
+    num_fewshot=0,
+    limit=-1,
+    batch_size=1,
+    device="cuda"):
+    """
+    model: model name
+    limit: number of test samples for debug, set to -1 is no limit
+    tasks: str tasks are split by ,
+    num_fewshot: Number of examples in few-shot context
+    eval_ppl: str datasets are split by , such as 'wikitext2,ptb,c4'
+    """
+    lm = EvalLM(model, tokenizer, batch_size=batch_size, device=device)
+    
+    results = {}
+            
+    if tasks != "":
+        t_results = evaluator.simple_evaluate(
+            lm,
+            tasks=tasks.split(","),
+            batch_size=batch_size,
+            num_fewshot=num_fewshot,
+            limit=None if limit == -1 else limit,
+            no_cache=True,
+        )
+        t_results = t_results["results"]
+        print("results: {}".format(t_results))
+        acc_list = [t_results[key]["acc"] for key in t_results.keys() if "acc" in t_results[key]]
+        mean_acc = sum(acc_list) / len(acc_list)
+        t_results["mean"] = mean_acc
+        results.update(t_results)
+        
+        print("\n" + "="*50)
+        print("EVALUATION RESULTS (formatted for easy copying)")
+        print("="*50)
+        
+        for task_name in sorted(t_results.keys()):
+            if task_name != "mean" and "acc" in t_results[task_name]:
+                acc_value = t_results[task_name]["acc"] * 100  
+                print(f"{task_name}: {acc_value:.2f}")
+        print(f"mean: {mean_acc * 100:.2f}")  
+    return results
 
-    return results 
+
+# @torch.no_grad()
+# def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"], 
+    #     num_fewshot=0, use_accelerate=False, add_special_tokens=False):
+    # from lm_eval import tasks, evaluator 
+    # def pattern_match(patterns, source_list):
+    #     task_names = set()
+    #     for pattern in patterns:
+    #         for matching in fnmatch.filter(source_list, pattern):
+    #             task_names.add(matching)
+    #     return list(task_names)
+    # task_names = pattern_match(task_list, tasks.ALL_TASKS)
+    # model_args = f"pretrained={model_name},cache_dir=./llm_weights"
+    # limit = None 
+    # if "70b" in model_name or "65b" in model_name:
+    #     limit = 2000
+    # if use_accelerate:
+    #     model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
+    # results = evaluator.simple_evaluate(
+    #     model="hf-causal-experimental",
+    #     model_args=model_args,
+    #     tasks=task_names,
+    #     num_fewshot=num_fewshot,
+    #     batch_size=None,
+    #     device=None,
+    #     no_cache=True,
+    #     limit=limit,
+    #     description_dict={},
+    #     decontamination_ngrams_path=None,
+    #     check_integrity=False,
+    #     pretrained_model=model,
+    #     tokenizer=tokenizer, 
+    #     add_special_tokens=add_special_tokens
+    # )
+
+    # return results 

@@ -1350,7 +1350,7 @@ if __name__ == '__main__':
             accelerate=False if torch.cuda.device_count() == 1 else True
             task_list = ["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa", "mathqa", "piqa"]
             num_shot = 0
-            results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
+            results = zeroshot_eval(model, tokenizer, task_list)
             print("zero_shot evaluation results")
             print(results)
         if args.save_path is not None:
@@ -1448,6 +1448,6 @@ if __name__ == '__main__':
             # task_list = ["hellaswag","winogrande", "arc_easy", "openbookqa", "piqa", "mathqa"]
             task_list = ["mathqa"]
             num_shot = 0
-            results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
+            results = zeroshot_eval(model, tokenizer, task_list)
             print("zero_shot evaluation results")
             print(results)
