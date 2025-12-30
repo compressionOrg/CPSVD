@@ -174,6 +174,7 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
         ppls[dataset] = ppl
     print("PPL after pruning: {}".format(ppls))
     print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
+    return ppls
 
 # only call this function when for 65b or more model    
 @torch.no_grad()
