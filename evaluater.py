@@ -92,23 +92,35 @@ class EvalLM(BaseLM):
 
 
 
+def _get_model_device(model):
+    """获取模型的设备，兼容不同模型类型"""
+    if hasattr(model, 'device'):
+        return model.device
+    # 对于使用 device_map='auto' 的模型，尝试从第一个参数获取设备
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 @torch.no_grad()
 def evaluate_perplexity(model, dataset, limit):
     """
     dataset: input ids tensor of shape [batch, sequence length]
     """
     nsamples, seqlen = dataset.size()
+    device = _get_model_device(model)
 
     nlls = []
 
     for i in range(nsamples):
         if i == limit:
             break
-        input_ids = dataset[i : i + 1, :-1].to(model.device)
+        input_ids = dataset[i : i + 1, :-1].to(device)
         labels = dataset[i : i + 1, 1:].contiguous()
         logits = model(input_ids=input_ids)[0]
         shift_logits = logits[:, :, :]
-        shift_labels = labels.to(model.device)
+        shift_labels = labels.to(device)
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),

@@ -73,13 +73,30 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
-    gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
-    cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
-    sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+    """
+    应用旋转位置编码，兼容新旧版本的 cos/sin 格式
     
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    新版 transformers (position_embeddings): cos/sin shape = [batch, seq_len, head_dim]
+    旧版 (LlamaRotaryEmbedding): cos/sin shape = [1, 1, seq_len, head_dim]
+    """
+    # 检查 cos 的维度来判断版本
+    if cos.dim() == 3:
+        # 新版格式: [batch, seq_len, head_dim] -> 需要扩展维度
+        # q/k shape: [batch, num_heads, seq_len, head_dim]
+        cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+        sin = sin.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+    else:
+        # 旧版格式: [1, 1, seq_len, head_dim]
+        gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
+        gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
+        cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+        sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+        
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+    
     return q_embed, k_embed
 
 
@@ -113,7 +130,7 @@ class SVD_LlamaMLP(nn.Module):
 class SVD_LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, ratio=1):
+    def __init__(self, config: LlamaConfig, ratio=1, layer_idx=0):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -121,6 +138,7 @@ class SVD_LlamaAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.ratio = ratio # 1 means no truncate, just keep normal attn
+        self.layer_idx = layer_idx  # 用于 DynamicCache 兼容
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -167,24 +185,62 @@ class SVD_LlamaAttention(nn.Module):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            # 兼容新旧版本的 past_key_value 格式
+            if hasattr(past_key_value, 'get_seq_length'):
+                # 新版本: DynamicCache 对象
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
+            elif isinstance(past_key_value, tuple) and len(past_key_value) > 0:
+                # 旧版本: (key, value) 元组
+                if hasattr(past_key_value[0], 'shape'):
+                    kv_seq_len += past_key_value[0].shape[-2]
+        
+        # 处理 position_embeddings (新版 API) 或使用 rotary_emb 计算
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+        else:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        
+        # 如果 position_ids 为 None，创建默认的 position_ids
+        if position_ids is None:
+            past_seen_tokens = 0
+            if past_key_value is not None:
+                if hasattr(past_key_value, 'get_seq_length'):
+                    past_seen_tokens = past_key_value.get_seq_length(self.layer_idx)
+                elif isinstance(past_key_value, tuple) and len(past_key_value) > 0:
+                    if hasattr(past_key_value[0], 'shape'):
+                        past_seen_tokens = past_key_value[0].shape[-2]
+            position_ids = torch.arange(
+                past_seen_tokens, past_seen_tokens + q_len, dtype=torch.long, device=hidden_states.device
+            ).unsqueeze(0)
  
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
 
         if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            # 兼容新旧版本的 past_key_value 格式
+            if hasattr(past_key_value, 'update'):
+                # 新版本: DynamicCache 对象
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
+            elif isinstance(past_key_value, tuple) and len(past_key_value) > 0:
+                # 旧版本: (key, value) 元组
+                if hasattr(past_key_value[0], 'shape'):
+                    key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                    value_states = torch.cat([past_key_value[1], value_states], dim=2)
+                past_key_value = (key_states, value_states)
+        elif use_cache:
+            past_key_value = (key_states, value_states)
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        if not use_cache:
+            past_key_value = None
+        
+        # 重新计算 kv_seq_len（在 cache 更新后）
+        kv_seq_len = key_states.shape[-2]
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz * self.num_heads, q_len, kv_seq_len)}, but is"
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
             )
 
