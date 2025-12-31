@@ -15,6 +15,7 @@ C-GSVR: Compensated Global Semantic Variable-Rank (补偿性全局语义变秩�
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -691,7 +692,7 @@ class CGSVRCompressor:
     def __init__(self,
                  damp: float = 0.01,
                  use_fisher: bool = True,
-                 use_compensation: bool = True,
+                 use_compensation: bool = False,
                  compensation_strength: float = 0.1):
         """
         Args:
@@ -715,7 +716,8 @@ class CGSVRCompressor:
                  calib_loader,
                  target_ratio: float,
                  device: str,
-                 model_name: str) -> nn.Module:
+                 model_name: str,
+                 checkpoint_path: str = None) -> nn.Module:
         """
         执行 C-GSVR 压缩
         
@@ -725,6 +727,7 @@ class CGSVRCompressor:
             target_ratio: 目标参数保留率
             device: 计算设备
             model_name: 模型名称
+            checkpoint_path: 中间结果保存路径 (Optional)
             
         Returns:
             compressed_model: 压缩后的模型
@@ -736,15 +739,44 @@ class CGSVRCompressor:
         print(f"Target ratio: {target_ratio:.2%}")
         print(f"Use Fisher: {self.use_fisher}")
         print(f"Use Compensation: {self.use_compensation}")
+        if checkpoint_path:
+            print(f"Checkpoint path: {checkpoint_path}")
+            os.makedirs(checkpoint_path, exist_ok=True)
         print(f"{'='*70}\n")
         
         # ========== Step 1: 收集统计信息 ==========
         print(f"\n[Step 1/5] Collecting Statistics...")
-        h_mat = self.fh_computer.collect_hessian(model, calib_loader, device, model_name)
         
+        stats_loaded = False
+        h_mat = None
         f_mat = None
-        if self.use_fisher:
-            f_mat = self.fh_computer.collect_fisher(model, calib_loader, device, model_name)
+        
+        if checkpoint_path:
+            stats_ckpt = os.path.join(checkpoint_path, "stats_checkpoint.pt")
+            if os.path.exists(stats_ckpt):
+                print(f"Loading statistics from {stats_ckpt}...")
+                try:
+                    stats_data = torch.load(stats_ckpt, map_location='cpu')
+                    h_mat = stats_data['h_mat']
+                    f_mat = stats_data['f_mat']
+                    stats_loaded = True
+                    print("Statistics loaded successfully!")
+                except Exception as e:
+                    print(f"Failed to load statistics: {e}")
+        
+        if not stats_loaded:
+            h_mat = self.fh_computer.collect_hessian(model, calib_loader, device, model_name)
+            
+            if self.use_fisher:
+                f_mat = self.fh_computer.collect_fisher(model, calib_loader, device, model_name)
+            
+            if checkpoint_path:
+                stats_ckpt = os.path.join(checkpoint_path, "stats_checkpoint.pt")
+                print(f"Saving statistics to {stats_ckpt}...")
+                torch.save({
+                    'h_mat': h_mat,
+                    'f_mat': f_mat
+                }, stats_ckpt)
         
         # ========== Step 2: 加权 SVD ==========
         print(f"\n[Step 2/5] Computing Weighted SVD...")
@@ -755,39 +787,68 @@ class CGSVRCompressor:
         else:
             raise ValueError(f"Unsupported model: {model_name}")
         
+        svd_loaded = False
         sigma_dict = {}
         shapes_dict = {}
         svd_cache = {}  # {global_name: (U, S, Vt, H_sqrt, F_sqrt)}
         layer_module_map = {}
         total_original_params = 0
         
-        for i in tqdm(range(len(layers)), desc="SVD computation"):
-            layer = layers[i]
-            layer_h = h_mat[i]
-            layer_f = f_mat[i] if f_mat else {}
+        if checkpoint_path:
+            svd_ckpt = os.path.join(checkpoint_path, "svd_checkpoint.pt")
+            if os.path.exists(svd_ckpt):
+                print(f"Loading SVD results from {svd_ckpt}...")
+                try:
+                    svd_data = torch.load(svd_ckpt, map_location='cpu')
+                    sigma_dict = svd_data['sigma_dict']
+                    shapes_dict = svd_data['shapes_dict']
+                    svd_cache = svd_data['svd_cache']
+                    layer_module_map = svd_data['layer_module_map']
+                    total_original_params = svd_data['total_original_params']
+                    svd_loaded = True
+                    print("SVD results loaded successfully!")
+                except Exception as e:
+                    print(f"Failed to load SVD results: {e}")
+        
+        if not svd_loaded:
+            for i in tqdm(range(len(layers)), desc="SVD computation"):
+                layer = layers[i]
+                layer_h = h_mat[i]
+                layer_f = f_mat[i] if f_mat else {}
+                
+                for name, module in layer.named_modules():
+                    if isinstance(module, nn.Linear) and name in layer_h:
+                        W = module.weight.data
+                        H = layer_h[name]
+                        F = layer_f.get(name, None)
+                        
+                        global_name = f"layer_{i}.{name}"
+                        
+                        # 执行加权 SVD
+                        U, S, Vt, H_sqrt, F_sqrt = self.svd_computer.weighted_svd(
+                            W, H, F, device
+                        )
+                        
+                        # 保存结果
+                        sigma_dict[global_name] = S.cpu()
+                        shapes_dict[global_name] = W.shape
+                        svd_cache[global_name] = (U.cpu(), S.cpu(), Vt.cpu(), 
+                                                  H_sqrt.cpu(), F_sqrt.cpu())
+                        layer_module_map[global_name] = (i, name)
+                        total_original_params += W.numel()
+                
+                torch.cuda.empty_cache()
             
-            for name, module in layer.named_modules():
-                if isinstance(module, nn.Linear) and name in layer_h:
-                    W = module.weight.data
-                    H = layer_h[name]
-                    F = layer_f.get(name, None)
-                    
-                    global_name = f"layer_{i}.{name}"
-                    
-                    # 执行加权 SVD
-                    U, S, Vt, H_sqrt, F_sqrt = self.svd_computer.weighted_svd(
-                        W, H, F, device
-                    )
-                    
-                    # 保存结果
-                    sigma_dict[global_name] = S.cpu()
-                    shapes_dict[global_name] = W.shape
-                    svd_cache[global_name] = (U.cpu(), S.cpu(), Vt.cpu(), 
-                                              H_sqrt.cpu(), F_sqrt.cpu())
-                    layer_module_map[global_name] = (i, name)
-                    total_original_params += W.numel()
-            
-            torch.cuda.empty_cache()
+            if checkpoint_path:
+                svd_ckpt = os.path.join(checkpoint_path, "svd_checkpoint.pt")
+                print(f"Saving SVD results to {svd_ckpt}...")
+                torch.save({
+                    'sigma_dict': sigma_dict,
+                    'shapes_dict': shapes_dict,
+                    'svd_cache': svd_cache,
+                    'layer_module_map': layer_module_map,
+                    'total_original_params': total_original_params
+                }, svd_ckpt)
         
         # ========== Step 3: 全局秩分配 ==========
         print(f"\n[Step 3/5] Global Rank Allocation...")
@@ -802,69 +863,90 @@ class CGSVRCompressor:
         print(f"\n[Step 4/5] Sequential Compression & Cross-layer Compensation...")
         compressed_modules = {}
         
-        # 收集校准输入用于误差补偿（如果启用）
-        layer_inputs = {}
-        if self.use_compensation:
-            layer_inputs = self._collect_layer_inputs(model, layers, calib_loader, device)
+        modules_loaded = False
+        if checkpoint_path:
+            comp_str = "comp" if self.use_compensation else "nocomp"
+            modules_ckpt = os.path.join(checkpoint_path, f"compressed_modules_{target_ratio}_{comp_str}.pt")
+            if os.path.exists(modules_ckpt):
+                print(f"Loading compressed modules from {modules_ckpt}...")
+                try:
+                    compressed_modules = torch.load(modules_ckpt, map_location='cpu')
+                    modules_loaded = True
+                    print("Compressed modules loaded successfully!")
+                except Exception as e:
+                    print(f"Failed to load compressed modules: {e}")
         
-        # 存储每层的累积误差，用于传递给下一层
-        accumulated_error = None
-        
-        for i in tqdm(range(len(layers)), desc="Compressing with compensation"):
-            layer = layers[i]
-            layer_error = {}  # 本层各模块的误差
+        if not modules_loaded:
+            # 收集校准输入用于误差补偿（如果启用）
+            layer_inputs = {}
+            if self.use_compensation:
+                layer_inputs = self._collect_layer_inputs(model, layers, calib_loader, device)
             
-            for name, module in layer.named_modules():
-                if isinstance(module, nn.Linear):
-                    global_name = f"layer_{i}.{name}"
-                    
-                    if global_name not in svd_cache:
-                        continue
-                    
-                    rank = rank_allocation.get(global_name, 0)
-                    
-                    if rank > 0:
-                        U, S, Vt, H_sqrt, F_sqrt = svd_cache[global_name]
-                        W_original = module.weight.data.clone()
-                        
-                        # 截断到分配的秩
-                        U_trunc = U[:, :rank]
-                        S_trunc = S[:rank]
-                        Vt_trunc = Vt[:rank, :]
-                        
-                        # 逆变换到原始空间
-                        U_final, Vt_final = self.svd_computer.unweight_transform(
-                            U_trunc.to(device), Vt_trunc.to(device),
-                            H_sqrt.to(device), F_sqrt.to(device)
-                        )
-                        
-                        # 计算本层压缩误差（用于传递给下一层）
-                        if self.use_compensation and i < len(layers) - 1:
-                            W_compressed = (U_final @ torch.diag(S_trunc.to(device))) @ Vt_final
-                            delta_W = W_original.to(device).float() - W_compressed
-                            layer_error[name] = delta_W.cpu()
-                        
-                        compressed_modules[global_name] = (
-                            U_final.cpu(), S_trunc.cpu(), Vt_final.cpu()
-                        )
-                    else:
-                        compressed_modules[global_name] = None
-                    
-                    # 释放 SVD 缓存
-                    del svd_cache[global_name]
+            # 存储每层的累积误差，用于传递给下一层
+            accumulated_error = None
             
-            # ===== 跨层误差补偿：将本层误差传递给下一层 =====
-            if self.use_compensation and i < len(layers) - 1 and layer_error:
-                next_layer = layers[i + 1]
-                next_layer_h = h_mat.get(i + 1, {})
+            for i in tqdm(range(len(layers)), desc="Compressing with compensation"):
+                layer = layers[i]
+                layer_error = {}  # 本层各模块的误差
                 
-                # 对下一层的权重进行补偿
-                self._apply_error_compensation(
-                    next_layer, layer_error, next_layer_h, 
-                    layer_inputs.get(i + 1, None), device
-                )
+                for name, module in layer.named_modules():
+                    if isinstance(module, nn.Linear):
+                        global_name = f"layer_{i}.{name}"
+                        
+                        if global_name not in svd_cache:
+                            continue
+                        
+                        rank = rank_allocation.get(global_name, 0)
+                        
+                        if rank > 0:
+                            U, S, Vt, H_sqrt, F_sqrt = svd_cache[global_name]
+                            W_original = module.weight.data.clone()
+                            
+                            # 截断到分配的秩
+                            U_trunc = U[:, :rank]
+                            S_trunc = S[:rank]
+                            Vt_trunc = Vt[:rank, :]
+                            
+                            # 逆变换到原始空间
+                            U_final, Vt_final = self.svd_computer.unweight_transform(
+                                U_trunc.to(device), Vt_trunc.to(device),
+                                H_sqrt.to(device), F_sqrt.to(device)
+                            )
+                            
+                            # 计算本层压缩误差（用于传递给下一层）
+                            if self.use_compensation and i < len(layers) - 1:
+                                W_compressed = (U_final @ torch.diag(S_trunc.to(device))) @ Vt_final
+                                delta_W = W_original.to(device).float() - W_compressed
+                                layer_error[name] = delta_W.cpu()
+                            
+                            compressed_modules[global_name] = (
+                                U_final.cpu(), S_trunc.cpu(), Vt_final.cpu()
+                            )
+                        else:
+                            compressed_modules[global_name] = None
+                        
+                        # 释放 SVD 缓存
+                        if global_name in svd_cache:
+                            del svd_cache[global_name]
+                
+                # ===== 跨层误差补偿：将本层误差传递给下一层 =====
+                if self.use_compensation and i < len(layers) - 1 and layer_error:
+                    next_layer = layers[i + 1]
+                    next_layer_h = h_mat.get(i + 1, {})
+                    
+                    # 对下一层的权重进行补偿
+                    self._apply_error_compensation(
+                        next_layer, layer_error, next_layer_h, 
+                        layer_inputs.get(i + 1, None), device
+                    )
+                
+                torch.cuda.empty_cache()
             
-            torch.cuda.empty_cache()
+            if checkpoint_path:
+                comp_str = "comp" if self.use_compensation else "nocomp"
+                modules_ckpt = os.path.join(checkpoint_path, f"compressed_modules_{target_ratio}_{comp_str}.pt")
+                print(f"Saving compressed modules to {modules_ckpt}...")
+                torch.save(compressed_modules, modules_ckpt)
         
         # ========== Step 5: 模型重构 ==========
         print(f"\n[Step 5/5] Model Reconstruction...")

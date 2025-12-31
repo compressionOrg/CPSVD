@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 # 默认参数
 MODEL=${MODEL:-"meta-llama/Llama-2-7b-hf"}
 RATIO=${RATIO:-0.8}
-NSAMPLES=${NSAMPLES:-128}
+NSAMPLES=${NSAMPLES:-256}
 SEQLEN=${SEQLEN:-2048}
 CALIB_DATA=${CALIB_DATA:-"wikitext2"}
 # 设置 USE_FISHER=0 可禁用 Fisher 信息收集（节省 GPU 内存）
@@ -32,7 +32,7 @@ if [ "$USE_FISHER" = "1" ]; then
 else
     FISHER_ARG="--no_fisher"
 fi
-
+    # --use_compensation \
 # 基础运行
 python CGSVR.py \
     --model $MODEL \
@@ -41,7 +41,6 @@ python CGSVR.py \
     --seqlen $SEQLEN \
     --calib_data $CALIB_DATA \
     $FISHER_ARG \
-    --use_compensation \
     --damp 0.01 \
     --eval_data wikitext2 \
     "$@"

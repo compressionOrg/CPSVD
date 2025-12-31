@@ -142,7 +142,7 @@ def main():
                         help='Use Fisher information for weighting')
     parser.add_argument('--no_fisher', action='store_true',
                         help='Disable Fisher information')
-    parser.add_argument('--use_compensation', action='store_true', default=True,
+    parser.add_argument('--use_compensation', action='store_true', default=False,
                         help='Enable error compensation')
     parser.add_argument('--no_compensation', action='store_true',
                         help='Disable error compensation')
@@ -164,7 +164,7 @@ def main():
     parser.add_argument('--eval_data', type=str, nargs='+',
                         default=['wikitext2'],
                         help='Evaluation datasets')
-    parser.add_argument('--eval_batch_size', type=int, default=32,
+    parser.add_argument('--eval_batch_size', type=int, default=4,
                         help='Batch size for evaluation')
     parser.add_argument('--skip_eval', action='store_true',
                         help='Skip evaluation after compression')
@@ -174,6 +174,8 @@ def main():
                         help='Save compressed model')
     parser.add_argument('--save_path', type=str, default=None,
                         help='Path to save compressed model')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='Path to save/load intermediate results')
     
     # 设备参数
     parser.add_argument('--device', type=str, default='cuda',
@@ -187,6 +189,12 @@ def main():
     if args.no_compensation:
         args.use_compensation = False
     
+    # 自动设置默认的 checkpoint 路径，以利用缓存
+    if args.checkpoint_path is None:
+        model_name_safe = args.model.split('/')[-1]
+        args.checkpoint_path = f"./checkpoints/{model_name_safe}"
+        print(f"Auto-configured checkpoint path: {args.checkpoint_path}")
+    
     # 打印配置
     print(f"\n{'='*70}")
     print(f"C-GSVR Configuration")
@@ -198,7 +206,10 @@ def main():
     print(f"Damping: {args.damp}")
     print(f"Calibration data: {args.calib_data} ({args.nsamples} samples)")
     print(f"Sequence length: {args.seqlen}")
+    print(f"Eval batch size: {args.eval_batch_size}")
     print(f"Device: {args.device}")
+    if args.checkpoint_path:
+        print(f"Checkpoint path: {args.checkpoint_path}")
     print(f"{'='*70}\n")
     
     # 加载模型
@@ -222,17 +233,16 @@ def main():
         calib_loader=calib_loader,
         target_ratio=args.ratio,
         device=args.device,
-        model_name=args.model
+        model_name=args.model,
+        checkpoint_path=args.checkpoint_path
     )
-    
+    # 保存模型
+    if args.save_model:
+        save_model(model, tokenizer, args, results)
     # 评估
     results = {}
     if not args.skip_eval:
         results = evaluate_model(model, tokenizer, args)
-    
-    # 保存模型
-    if args.save_model:
-        save_model(model, tokenizer, args, results)
     
     print(f"\n{'='*70}")
     print(f"C-GSVR Compression Complete!")

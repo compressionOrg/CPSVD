@@ -152,7 +152,7 @@ def evaluate_perplexity(model, dataset, limit):
 
 
 @torch.no_grad()
-def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_len=2048, batch_size=32, device="cuda"):
+def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_len=2048, batch_size=4, device="cuda"):
     # model.to(device)
     model.eval()
     ppls = {}
@@ -178,7 +178,7 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
 
 # only call this function when for 65b or more model    
 @torch.no_grad()
-def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_len=2048, batch_size=32, device="cuda"):
+def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_len=2048, batch_size=4, device="cuda"):
     import  torch.nn as nn
     class LlamaRMSNorm(nn.Module):
         def __init__(self, hidden_size=model.config.hidden_size, eps=model.config.rms_norm_eps):
