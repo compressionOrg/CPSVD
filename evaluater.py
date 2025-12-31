@@ -291,10 +291,13 @@ def zeroshot_eval(
     
     results = {}
             
-    if tasks != "":
+    if tasks:
+        if isinstance(tasks, str):
+            tasks = tasks.split(",")
+            
         t_results = evaluator.simple_evaluate(
             lm,
-            tasks=tasks.split(","),
+            tasks=tasks,
             batch_size=batch_size,
             num_fewshot=num_fewshot,
             limit=None if limit == -1 else limit,
