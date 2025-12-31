@@ -583,6 +583,82 @@ class MarginalUtilityRankAllocator:
         
         return rank_allocation
 
+    def allocate_fixed_ranks(self,
+                              total_original_params: int,
+                              target_ratio: float,
+                              shapes_dict: Dict[str, Tuple[int, int]],
+                              fixed_rank_value: int = None) -> Dict[str, int]:
+        """
+        固定秩分配：所有层使用相同的秩
+        
+        如果未指定 fixed_rank_value，则根据目标压缩率计算一个合适的固定秩值。
+        
+        Args:
+            total_original_params: 原始总参数量
+            target_ratio: 目标参数保留率
+            shapes_dict: {global_name: (out_dim, in_dim)} 形状字典
+            fixed_rank_value: 固定秩值（可选，如不指定则自动计算）
+            
+        Returns:
+            rank_allocation: {global_name: allocated_rank}
+        """
+        target_budget = int(total_original_params * target_ratio)
+        
+        print(f"\n{'='*70}")
+        print(f"[C-GSVR] Fixed Rank Allocation")
+        print(f"{'='*70}")
+        print(f"Original params: {total_original_params:,}")
+        print(f"Target budget: {target_budget:,} ({target_ratio:.2%})")
+        
+        if fixed_rank_value is not None:
+            # 使用用户指定的固定秩值
+            fixed_rank = fixed_rank_value
+            print(f"Using user-specified fixed rank: {fixed_rank}")
+        else:
+            # 根据目标压缩率自动计算固定秩
+            # 计算方法：假设所有层使用相同的秩 r，则
+            # total_compressed = sum_{all layers} r * (out_dim + in_dim)
+            # 我们需要找到满足 total_compressed <= target_budget 的最大 r
+            
+            total_cost_per_rank = sum(out_dim + in_dim for out_dim, in_dim in shapes_dict.values())
+            fixed_rank = max(1, target_budget // total_cost_per_rank)
+            print(f"Auto-computed fixed rank: {fixed_rank}")
+            print(f"  (based on {len(shapes_dict)} modules, cost per rank: {total_cost_per_rank:,})")
+        
+        # 为所有模块分配相同的秩，但需要确保不超过模块的最小维度
+        rank_allocation = {}
+        current_budget = 0
+        
+        for global_name, (out_dim, in_dim) in shapes_dict.items():
+            # 秩不能超过矩阵的最小维度
+            max_rank = min(out_dim, in_dim)
+            actual_rank = min(fixed_rank, max_rank)
+            rank_allocation[global_name] = actual_rank
+            current_budget += actual_rank * (out_dim + in_dim)
+        
+        # 统计
+        print(f"\nFixed rank applied: {fixed_rank}")
+        print(f"Allocated budget: {current_budget:,} ({current_budget/total_original_params:.2%})")
+        print(f"Budget error: {abs(current_budget - target_budget)/target_budget*100:.2f}%")
+        
+        # 打印每层分配示例
+        layer_ranks = {}
+        for name, rank in rank_allocation.items():
+            parts = name.split('.')
+            layer_idx = int(parts[0].replace('layer_', ''))
+            if layer_idx not in layer_ranks:
+                layer_ranks[layer_idx] = {}
+            module_name = '.'.join(parts[1:])
+            layer_ranks[layer_idx][module_name] = rank
+        
+        print(f"\nRank allocation per layer (fixed):")
+        for layer_idx in sorted(layer_ranks.keys())[:3]:
+            print(f"  Layer {layer_idx}: {layer_ranks[layer_idx]}")
+        if len(layer_ranks) > 3:
+            print(f"  ... ({len(layer_ranks) - 3} more layers with same fixed rank)")
+        
+        return rank_allocation
+
 
 class RecursiveErrorCompensator:
     """
@@ -693,18 +769,24 @@ class CGSVRCompressor:
                  damp: float = 0.01,
                  use_fisher: bool = True,
                  use_compensation: bool = False,
-                 compensation_strength: float = 0.1):
+                 compensation_strength: float = 0.1,
+                 fixed_rank: bool = False,
+                 fixed_rank_value: int = None):
         """
         Args:
             damp: 阻尼系数
             use_fisher: 是否使用 Fisher 信息
             use_compensation: 是否启用误差补偿
             compensation_strength: 误差补偿强度
+            fixed_rank: 是否使用固定秩（所有层使用相同的秩）
+            fixed_rank_value: 固定秩的值（仅当 fixed_rank=True 时使用）
         """
         self.damp = damp
         self.use_fisher = use_fisher
         self.use_compensation = use_compensation
         self.compensation_strength = compensation_strength
+        self.fixed_rank = fixed_rank
+        self.fixed_rank_value = fixed_rank_value
         
         self.fh_computer = FisherHessianComputer(damp)
         self.svd_computer = WeightedSVDComputer(damp, use_fisher)
@@ -739,6 +821,9 @@ class CGSVRCompressor:
         print(f"Target ratio: {target_ratio:.2%}")
         print(f"Use Fisher: {self.use_fisher}")
         print(f"Use Compensation: {self.use_compensation}")
+        print(f"Rank Mode: {'Fixed' if self.fixed_rank else 'Variable (Marginal Utility)'}")
+        if self.fixed_rank and self.fixed_rank_value:
+            print(f"Fixed Rank Value: {self.fixed_rank_value}")
         if checkpoint_path:
             print(f"Checkpoint path: {checkpoint_path}")
             os.makedirs(checkpoint_path, exist_ok=True)
@@ -852,12 +937,20 @@ class CGSVRCompressor:
         
         # ========== Step 3: 全局秩分配 ==========
         print(f"\n[Step 3/5] Global Rank Allocation...")
-        self.rank_allocator.build_global_utility_table(
-            sigma_dict, shapes_dict, layer_module_map
-        )
-        rank_allocation = self.rank_allocator.allocate_ranks(
-            total_original_params, target_ratio
-        )
+        
+        if self.fixed_rank:
+            # 固定秩模式：所有层使用相同的秩
+            rank_allocation = self.rank_allocator.allocate_fixed_ranks(
+                total_original_params, target_ratio, shapes_dict, self.fixed_rank_value
+            )
+        else:
+            # 可变秩模式：基于边际效用的自适应秩分配
+            self.rank_allocator.build_global_utility_table(
+                sigma_dict, shapes_dict, layer_module_map
+            )
+            rank_allocation = self.rank_allocator.allocate_ranks(
+                total_original_params, target_ratio
+            )
         
         # ========== Step 4: 顺序压缩与跨层误差补偿 ==========
         print(f"\n[Step 4/5] Sequential Compression & Cross-layer Compensation...")

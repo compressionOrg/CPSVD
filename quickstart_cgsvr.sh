@@ -42,6 +42,7 @@ python CGSVR.py \
     --calib_data $CALIB_DATA \
     $FISHER_ARG \
     --damp 0.01 \
+    --fixed_rank \
     --eval_data wikitext2 \
     "$@"
 

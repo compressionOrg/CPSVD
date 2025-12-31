@@ -151,6 +151,12 @@ def main():
     parser.add_argument('--compensation_strength', type=float, default=0.1,
                         help='Error compensation strength')
     
+    # 秩分配模式
+    parser.add_argument('--fixed_rank', action='store_true', default=False,
+                        help='Use fixed rank for all layers (if not set, use variable rank based on marginal utility)')
+    parser.add_argument('--fixed_rank_value', type=int, default=None,
+                        help='Fixed rank value for all layers (only used when --fixed_rank is set). If not specified, will be computed from ratio.')
+    
     # 校准数据参数
     parser.add_argument('--calib_data', type=str, default='wikitext2',
                         choices=['wikitext2', 'ptb', 'c4'],
@@ -204,6 +210,9 @@ def main():
     print(f"Use Fisher: {args.use_fisher}")
     print(f"Use Compensation: {args.use_compensation}")
     print(f"Damping: {args.damp}")
+    print(f"Rank Mode: {'Fixed' if args.fixed_rank else 'Variable (Marginal Utility)'}")
+    if args.fixed_rank and args.fixed_rank_value:
+        print(f"Fixed Rank Value: {args.fixed_rank_value}")
     print(f"Calibration data: {args.calib_data} ({args.nsamples} samples)")
     print(f"Sequence length: {args.seqlen}")
     print(f"Eval batch size: {args.eval_batch_size}")
@@ -224,7 +233,9 @@ def main():
         damp=args.damp,
         use_fisher=args.use_fisher,
         use_compensation=args.use_compensation,
-        compensation_strength=args.compensation_strength
+        compensation_strength=args.compensation_strength,
+        fixed_rank=args.fixed_rank,
+        fixed_rank_value=args.fixed_rank_value
     )
     
     # 执行压缩
