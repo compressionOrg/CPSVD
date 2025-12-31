@@ -3,7 +3,7 @@ C-GSVR: Compensated Global Semantic Variable-Rank (补偿性全局语义变秩�
 
 核心思想：
 1. 边际效用等价原理 - 每层增加一个秩的效用/成本比相等时全局最优
-2. Fisher-Hessian 联合空间 - 双重加权的奇异值重要性评分
+2. SVD-LLM 白化 - 使用 Cholesky 分解进行输入协方差白化
 3. 递归误差吸收 - 利用下一层 Hessian 逆吸收当前层截断误差
 
 主要优势：
@@ -20,6 +20,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from tqdm import tqdm
 import heapq
+from utils.model_utils import find_layers
 
 
 @dataclass
@@ -37,38 +38,41 @@ class MarginalUtilityEntry:
         return self.marginal_utility > other.marginal_utility
 
 
-class FisherHessianComputer:
+class WhiteningComputer:
     """
-    Fisher-Hessian 联合信息计算器
+    SVD-LLM 风格的白化计算器
     
-    - Hessian (H): 输入协方差矩阵，反映输入能量分布
-    - Fisher (F): 输出敏感度矩阵，反映对损失的影响
+    使用 Cholesky 分解对输入协方差矩阵进行白化：
+    1. 收集输入协方差: H = X^T @ X
+    2. Cholesky 分解: L = cholesky(H)
+    3. 白化后 SVD: W @ L = U @ S @ V^T
+    4. 逆变换: V' = V @ L^(-1)
     
-    联合空间变换: W̃ = F^(1/2) @ W @ H^(1/2)
+    这是 SVD-LLM 论文中的核心方法，比 Fisher-Hessian 方法更稳定高效
     """
     
-    def __init__(self, damp: float = 0.01, fisher_weight: float = 1.0):
+    def __init__(self, damp: float = 1e-6):
         """
         Args:
             damp: 阻尼系数，用于数值稳定
-            fisher_weight: Fisher 信息权重 (相对于 Hessian)
         """
         self.damp = damp
-        self.fisher_weight = fisher_weight
     
     @torch.no_grad()
-    def collect_hessian(self, 
-                        model, 
-                        calib_loader, 
-                        device: str,
-                        model_name: str) -> Dict[int, Dict[str, torch.Tensor]]:
+    def collect_scaling_matrices(self, 
+                                  model, 
+                                  calib_loader, 
+                                  device: str,
+                                  model_name: str) -> Dict[int, Dict[str, torch.Tensor]]:
         """
-        收集 Hessian 矩阵 (输入协方差)
+        收集白化矩阵 (SVD-LLM 方式)
         
-        H_l = (1/N) * Σ X_l^T @ X_l
+        步骤：
+        1. 注册 hook 收集每个 Linear 层的输入协方差 X^T @ X
+        2. 对协方差矩阵进行 Cholesky 分解得到白化矩阵 L
         
         Returns:
-            h_mat: {layer_idx: {module_name: H_matrix}}
+            scaling_mat: {layer_idx: {module_name: L_matrix}}
         """
         if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
             layers = model.model.layers
@@ -79,391 +83,152 @@ class FisherHessianComputer:
         
         model = model.to(device)
         print(f"\n{'='*70}")
-        print(f"[C-GSVR] Collecting Hessian (Input Covariance) Matrices...")
+        print(f"[C-GSVR] Collecting Whitening Matrices (SVD-LLM Style)...")
         print(f"{'='*70}")
         
-        # 存储样本数
-        sample_count = [0]
-        
+        # Hook 函数：累积输入协方差 X^T @ X
         def make_hook(module):
             def hook(m, inp, out):
                 x = inp[0].detach().float()
                 if x.dim() == 2:
                     x = x.unsqueeze(0)
                 # X^T @ X: [in_dim, in_dim]
-                batch_size, seq_len = x.shape[0], x.shape[1]
-                x_flat = x.view(-1, x.shape[-1])  # [batch*seq, in_dim]
-                h_add = (x_flat.T @ x_flat).cpu()  # 立即移到 CPU 避免 GPU OOM
-                
-                if not hasattr(m, '_hessian_acc'):
-                    m._hessian_acc = torch.zeros_like(h_add)
-                    m._hessian_count = 0
-                
-                m._hessian_acc += h_add
-                m._hessian_count += x_flat.shape[0]
-                
-                del x, x_flat, h_add
+                adds = torch.matmul(x.transpose(1, 2), x)
+                adds_sum = torch.sum(adds, dim=0)
+                m.raw_scaling_diag_matrix += adds_sum
+                del x, adds, adds_sum
+                torch.cuda.empty_cache()
             return hook
         
         # 注册 hook
         hooks = []
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
+                module.raw_scaling_diag_matrix = 0
                 h = module.register_forward_hook(make_hook(module))
                 hooks.append(h)
         
-        # 前向传播
-        for batch in tqdm(calib_loader, desc="Hessian forward pass"):
-            if isinstance(batch, (tuple, list)):
-                input_ids = batch[0].to(device)
-            elif isinstance(batch, dict):
-                input_ids = batch['input_ids'].to(device)
+        # 前向传播收集统计信息
+        for batch in tqdm(calib_loader, desc="Collecting input covariance"):
+            if isinstance(batch, dict):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                model(**batch)
             else:
-                input_ids = batch.to(device)
-            
-            attention_mask = torch.ones_like(input_ids)
-            with torch.no_grad():
+                if isinstance(batch, (tuple, list)):
+                    input_ids = batch[0].to(device)
+                else:
+                    input_ids = batch.to(device)
+                attention_mask = torch.ones_like(input_ids)
                 model(input_ids=input_ids, attention_mask=attention_mask)
-            sample_count[0] += 1
-            
-            # 定期清理内存
-            if sample_count[0] % 16 == 0:
-                torch.cuda.empty_cache()
         
         # 清理 hooks
         for h in hooks:
             h.remove()
         
-        # 收集并归一化
-        h_mat = {}
-        for i, layer in enumerate(layers):
-            layer_h = {}
-            for name, module in layer.named_modules():
-                if isinstance(module, nn.Linear) and hasattr(module, '_hessian_acc'):
-                    # 归一化（已经在 CPU 上）
-                    H = module._hessian_acc / max(module._hessian_count, 1)
-                    layer_h[name] = H
-                    del module._hessian_acc
-                    del module._hessian_count
-            h_mat[i] = layer_h
+        torch.cuda.empty_cache()
+        model = model.cpu()
+        
+        # 将原始协方差矩阵移到 CPU
+        for i in range(len(layers)):
+            subset = find_layers(layers[i])
+            for name in subset:
+                if hasattr(subset[name], 'raw_scaling_diag_matrix'):
+                    subset[name].raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.cpu()
+        
+        # Cholesky 分解
+        scaling_mat = {}
+        print("Start Cholesky Decomposition...")
+        for i in tqdm(range(len(layers)), desc="Cholesky decomposition"):
+            layer_scaling = {}
+            subset = find_layers(layers[i])
+            for name in subset:
+                if not hasattr(subset[name], 'raw_scaling_diag_matrix'):
+                    continue
+                    
+                raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.double().to(device)
+                
+                try:
+                    scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
+                except Exception as e:
+                    print(f"Warning: Cholesky failed for layer {i}.{name}, adding regularization")
+                    eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
+                    raw_scaling_diag_matrix += (-eigenvalues[0] + self.damp) * torch.eye(
+                        raw_scaling_diag_matrix.shape[0], device=device
+                    )
+                    scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
+                
+                layer_scaling[name] = scaling_diag_matrix.cpu()
+                
+                # 清理
+                del subset[name].raw_scaling_diag_matrix
+                del raw_scaling_diag_matrix, scaling_diag_matrix
+                torch.cuda.empty_cache()
+            
+            scaling_mat[i] = layer_scaling
         
         torch.cuda.empty_cache()
-        print(f"Hessian collection completed for {len(h_mat)} layers.\n")
-        return h_mat
+        print(f"Whitening matrix collection completed for {len(scaling_mat)} layers.\n")
+        return scaling_mat
+
+
+class WhitenedSVDComputer:
+    """
+    白化 SVD 计算器 (SVD-LLM 风格)
     
-    def collect_fisher(self,
-                       model,
-                       calib_loader,
-                       device: str,
-                       model_name: str,
-                       use_diagonal: bool = True) -> Dict[int, Dict[str, torch.Tensor]]:
+    对 W @ L 进行 SVD 分解，其中 L 是 Cholesky 分解得到的白化矩阵
+    """
+    
+    def __init__(self, damp: float = 1e-6):
+        self.damp = damp
+    
+    def whitened_svd(self,
+                     W: torch.Tensor,
+                     scaling_matrix: torch.Tensor,
+                     device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        收集 Fisher 信息矩阵 (输出敏感度)
+        执行白化后的 SVD
         
-        F_l = (1/N) * Σ (∂L/∂Y_l)^T @ (∂L/∂Y_l)
-        
-        为避免 GPU 内存溢出，使用对角近似：只保留对角线元素
-        F_diag = (1/N) * Σ (∂L/∂Y_l)² 
-        
-        其中 Y_l = W_l @ X_l 是层 l 的输出
+        W_scaled = W @ L
+        W_scaled = U @ S @ V^T
+        V_final = V @ L^(-1)  (逆变换到原始空间)
         
         Args:
-            use_diagonal: 是否使用对角近似（推荐 True 以节省内存）
-        
-        Returns:
-            f_mat: {layer_idx: {module_name: F_matrix}}
-        """
-        if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
-            layers = model.model.layers
-        elif "opt" in model_name:
-            layers = model.model.decoder.layers
-        else:
-            raise ValueError(f"Unsupported model: {model_name}")
-        
-        print(f"\n{'='*70}")
-        print(f"[C-GSVR] Collecting Fisher (Output Sensitivity) Matrices...")
-        print(f"[C-GSVR] Using diagonal approximation: {use_diagonal}")
-        print(f"{'='*70}")
-        
-        def make_grad_hook(module, use_diag):
-            def hook(m, grad_input, grad_output):
-                grad = grad_output[0]
-                if grad is None:
-                    return
-                
-                grad = grad.detach().float()
-                if grad.dim() == 2:
-                    grad = grad.unsqueeze(0)
-                
-                grad_flat = grad.view(-1, grad.shape[-1])  # [batch*seq, out_dim]
-                
-                if use_diag:
-                    # 对角近似：只计算每个输出维度的梯度平方和
-                    # f_diag = sum(grad^2, dim=0)  shape: [out_dim]
-                    f_add = (grad_flat ** 2).sum(dim=0).cpu()  # 立即移到 CPU
-                    
-                    if not hasattr(m, '_fisher_diag'):
-                        m._fisher_diag = torch.zeros_like(f_add)
-                        m._fisher_count = 0
-                    
-                    m._fisher_diag += f_add
-                    m._fisher_count += grad_flat.shape[0]
-                else:
-                    # 完整 Fisher（可能导致 OOM）
-                    f_add = (grad_flat.T @ grad_flat).cpu()  # 立即移到 CPU
-                    
-                    if not hasattr(m, '_fisher_acc'):
-                        m._fisher_acc = torch.zeros_like(f_add)
-                        m._fisher_count = 0
-                    
-                    m._fisher_acc += f_add
-                    m._fisher_count += grad_flat.shape[0]
-                
-                # 及时清理 GPU 内存
-                del grad, grad_flat, f_add
-            return hook
-        
-        # 注册反向 hook
-        hooks = []
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                h = module.register_full_backward_hook(make_grad_hook(module, use_diagonal))
-                hooks.append(h)
-        
-        model.train()  # 需要启用梯度
-        
-        # 限制处理的样本数以节省内存
-        max_fisher_samples = min(len(calib_loader), 256)  # 最多使用 256 个样本
-        
-        for idx, batch in enumerate(tqdm(calib_loader, desc="Fisher backward pass")):
-            if idx >= max_fisher_samples:
-                break
-                
-            if isinstance(batch, (tuple, list)):
-                input_ids = batch[0].to(device)
-                labels = batch[1].to(device) if len(batch) > 1 else input_ids.clone()
-            elif isinstance(batch, dict):
-                input_ids = batch['input_ids'].to(device)
-                labels = batch.get('labels', input_ids.clone()).to(device)
-            else:
-                input_ids = batch.to(device)
-                labels = input_ids.clone()
+            W: 原始权重矩阵 [out_dim, in_dim]
+            scaling_matrix: Cholesky 分解得到的白化矩阵 L [in_dim, in_dim]
+            device: 计算设备
             
-            # 语言模型损失
-            model.zero_grad()
-            outputs = model(input_ids=input_ids, labels=labels)
-            loss = outputs.loss
-            loss.backward()
-            
-            # 每个 batch 后清理内存
-            del outputs, loss, input_ids, labels
-            torch.cuda.empty_cache()
-        
-        model.eval()
-        
-        # 清理 hooks
-        for h in hooks:
-            h.remove()
-        
-        # 收集并归一化
-        f_mat = {}
-        for i, layer in enumerate(layers):
-            layer_f = {}
-            for name, module in layer.named_modules():
-                if isinstance(module, nn.Linear):
-                    if use_diagonal and hasattr(module, '_fisher_diag'):
-                        # 将对角向量转换为对角矩阵
-                        f_diag = module._fisher_diag / max(module._fisher_count, 1)
-                        # 创建对角矩阵
-                        F = torch.diag(f_diag)
-                        layer_f[name] = F
-                        del module._fisher_diag
-                        del module._fisher_count
-                    elif hasattr(module, '_fisher_acc'):
-                        F = module._fisher_acc / max(module._fisher_count, 1)
-                        layer_f[name] = F
-                        del module._fisher_acc
-                        del module._fisher_count
-            f_mat[i] = layer_f
-        
-        torch.cuda.empty_cache()
-        print(f"Fisher collection completed for {len(f_mat)} layers.\n")
-        return f_mat
-    
-    def compute_sqrt_matrix(self, M: torch.Tensor, damp: float = None) -> torch.Tensor:
-        """
-        计算矩阵的平方根 M^(1/2)
-        使用特征分解: M = V @ Λ @ V^T => M^(1/2) = V @ Λ^(1/2) @ V^T
-        
-        对于对角矩阵，使用更高效的逐元素开方
-        """
-        if damp is None:
-            damp = self.damp
-        
-        M = M.float()
-        
-        # 检查是否接近零
-        if M.abs().max() < 1e-10:
-            return torch.eye(M.size(0), device=M.device, dtype=M.dtype)
-        
-        n = M.size(0)
-        
-        # 检测是否为对角矩阵（更高效的处理）
-        off_diag_norm = (M - torch.diag(M.diag())).abs().max()
-        if off_diag_norm < 1e-8:
-            # 对角矩阵：直接对对角线元素开方
-            diag_vals = M.diag()
-            damp_val = max(damp * diag_vals.abs().mean().item(), 1e-6)
-            diag_sqrt = torch.sqrt(torch.clamp(diag_vals + damp_val, min=1e-6))
-            return torch.diag(diag_sqrt)
-        
-        M = (M + M.T) / 2.0  # 确保对称
-        
-        # 添加阻尼
-        diag_mean = M.diag().abs().mean()
-        damp_val = max(damp * diag_mean.item(), 1e-6)
-        M_damped = M + damp_val * torch.eye(n, device=M.device, dtype=M.dtype)
-        
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(M_damped)
-            eigenvalues = torch.clamp(eigenvalues, min=1e-6)
-            M_sqrt = eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ eigenvectors.T
-        except RuntimeError:
-            print("Warning: Eigendecomposition failed, using identity")
-            M_sqrt = torch.eye(n, device=M.device, dtype=M.dtype)
-        
-        return M_sqrt
-    
-    def compute_inv_sqrt_matrix(self, M: torch.Tensor, damp: float = None) -> torch.Tensor:
-        """
-        计算矩阵的逆平方根 M^(-1/2)
-        
-        对于对角矩阵，使用更高效的逐元素计算
-        """
-        if damp is None:
-            damp = self.damp
-        
-        M = M.float()
-        
-        if M.abs().max() < 1e-10:
-            return torch.eye(M.size(0), device=M.device, dtype=M.dtype)
-        
-        n = M.size(0)
-        
-        # 检测是否为对角矩阵
-        off_diag_norm = (M - torch.diag(M.diag())).abs().max()
-        if off_diag_norm < 1e-8:
-            # 对角矩阵：直接对对角线元素求逆平方根
-            diag_vals = M.diag()
-            damp_val = max(damp * diag_vals.abs().mean().item(), 1e-6)
-            diag_inv_sqrt = 1.0 / torch.sqrt(torch.clamp(diag_vals + damp_val, min=1e-6))
-            return torch.diag(diag_inv_sqrt)
-        
-        M = (M + M.T) / 2.0
-        
-        diag_mean = M.diag().abs().mean()
-        damp_val = max(damp * diag_mean.item(), 1e-6)
-        M_damped = M + damp_val * torch.eye(n, device=M.device, dtype=M.dtype)
-        
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(M_damped)
-            eigenvalues = torch.clamp(eigenvalues, min=1e-6)
-            M_inv_sqrt = eigenvectors @ torch.diag(1.0 / torch.sqrt(eigenvalues)) @ eigenvectors.T
-        except RuntimeError:
-            print("Warning: Inverse sqrt computation failed, using identity")
-            M_inv_sqrt = torch.eye(n, device=M.device, dtype=M.dtype)
-        
-        return M_inv_sqrt
-
-
-class WeightedSVDComputer:
-    """
-    加权 SVD 计算器
-    
-    对 W̃ = F^(1/2) @ W @ H^(1/2) 进行 SVD 分解
-    得到语义重要性加权的奇异值
-    """
-    
-    def __init__(self, damp: float = 0.01, use_fisher: bool = True):
-        self.damp = damp
-        self.use_fisher = use_fisher
-        self.fh_computer = FisherHessianComputer(damp)
-    
-    def weighted_svd(self,
-                     W: torch.Tensor,
-                     H: torch.Tensor,
-                     F: Optional[torch.Tensor] = None,
-                     device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                                                     torch.Tensor, torch.Tensor]:
-        """
-        执行加权 SVD
-        
-        W̃ = F^(1/2) @ W @ H^(1/2)
-        W̃ = U @ Σ @ V^T
-        
         Returns:
-            U, S, Vt: SVD 分解结果
-            H_sqrt, F_sqrt: 用于逆变换的矩阵
+            U, S, Vt: SVD 分解结果（Vt 已经逆变换到原始空间）
+            scaling_matrix: 白化矩阵（用于后续参考）
         """
         W = W.float().to(device)
-        H = H.float().to(device)
+        scaling_matrix = scaling_matrix.float().to(device)
+        dtype = W.dtype
         
-        # 计算 H^(1/2)
-        H_sqrt = self.fh_computer.compute_sqrt_matrix(H, self.damp)
+        # 计算白化矩阵的逆
+        try:
+            scaling_matrix_inv = torch.linalg.inv(scaling_matrix)
+        except Exception as e:
+            print("Warning: scaling_matrix is not full rank, adding regularization")
+            scaling_matrix += self.damp * torch.eye(scaling_matrix.shape[0], device=device)
+            scaling_matrix_inv = torch.linalg.inv(scaling_matrix)
         
-        # Hessian 空间白化: W @ H^(1/2)
-        W_h = W @ H_sqrt
-        
-        # 可选: Fisher 空间白化
-        if self.use_fisher and F is not None:
-            F = F.float().to(device)
-            F_sqrt = self.fh_computer.compute_sqrt_matrix(F, self.damp)
-            W_weighted = F_sqrt @ W_h
-        else:
-            F_sqrt = torch.eye(W.size(0), device=device, dtype=W.dtype)
-            W_weighted = W_h
+        # 白化: W @ L
+        W_scaled = torch.matmul(W, scaling_matrix)
         
         # SVD 分解
         try:
-            U, S, Vt = torch.linalg.svd(W_weighted, full_matrices=False)
+            U, S, Vt = torch.linalg.svd(W_scaled, full_matrices=False)
         except RuntimeError as e:
             print(f"Warning: SVD failed: {e}, using unweighted SVD")
             U, S, Vt = torch.linalg.svd(W, full_matrices=False)
-            H_sqrt = torch.eye(W.size(1), device=device, dtype=W.dtype)
-            F_sqrt = torch.eye(W.size(0), device=device, dtype=W.dtype)
+            return U, S, Vt, torch.eye(W.size(1), device=device, dtype=dtype)
         
-        return U, S, Vt, H_sqrt, F_sqrt
-    
-    def unweight_transform(self,
-                           U: torch.Tensor,
-                           Vt: torch.Tensor,
-                           H_sqrt: torch.Tensor,
-                           F_sqrt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        逆变换：将加权 SVD 结果转换回原始空间
+        # 逆变换: V' = V @ L^(-1)
+        # 注意: Vt 是 V 的转置，所以 Vt_final = Vt @ L^(-1)
+        Vt_final = torch.matmul(Vt, scaling_matrix_inv)
         
-        W' = F^(-1/2) @ U @ Σ' @ V^T @ H^(-1/2)
-        
-        Returns:
-            U_final, Vt_final: 原始空间的 U 和 V^T
-        """
-        device = U.device
-        
-        # F^(-1/2) @ U
-        F_inv_sqrt = self.fh_computer.compute_inv_sqrt_matrix(
-            F_sqrt @ F_sqrt,  # 从 F^(1/2) 恢复 F
-            self.damp
-        )
-        U_final = F_inv_sqrt @ U
-        
-        # V^T @ H^(-1/2)
-        H_inv_sqrt = self.fh_computer.compute_inv_sqrt_matrix(
-            H_sqrt @ H_sqrt,
-            self.damp
-        )
-        Vt_final = Vt @ H_inv_sqrt
-        
-        return U_final, Vt_final
+        return U, S, Vt_final, scaling_matrix
 
 
 class MarginalUtilityRankAllocator:
@@ -583,12 +348,88 @@ class MarginalUtilityRankAllocator:
         
         return rank_allocation
 
+    def allocate_fixed_ranks(self,
+                              total_original_params: int,
+                              target_ratio: float,
+                              shapes_dict: Dict[str, Tuple[int, int]],
+                              fixed_rank_value: int = None) -> Dict[str, int]:
+        """
+        固定秩分配：所有层使用相同的秩
+        
+        如果未指定 fixed_rank_value，则根据目标压缩率计算一个合适的固定秩值。
+        
+        Args:
+            total_original_params: 原始总参数量
+            target_ratio: 目标参数保留率
+            shapes_dict: {global_name: (out_dim, in_dim)} 形状字典
+            fixed_rank_value: 固定秩值（可选，如不指定则自动计算）
+            
+        Returns:
+            rank_allocation: {global_name: allocated_rank}
+        """
+        target_budget = int(total_original_params * target_ratio)
+        
+        print(f"\n{'='*70}")
+        print(f"[C-GSVR] Fixed Rank Allocation")
+        print(f"{'='*70}")
+        print(f"Original params: {total_original_params:,}")
+        print(f"Target budget: {target_budget:,} ({target_ratio:.2%})")
+        
+        if fixed_rank_value is not None:
+            # 使用用户指定的固定秩值
+            fixed_rank = fixed_rank_value
+            print(f"Using user-specified fixed rank: {fixed_rank}")
+        else:
+            # 根据目标压缩率自动计算固定秩
+            # 计算方法：假设所有层使用相同的秩 r，则
+            # total_compressed = sum_{all layers} r * (out_dim + in_dim)
+            # 我们需要找到满足 total_compressed <= target_budget 的最大 r
+            
+            total_cost_per_rank = sum(out_dim + in_dim for out_dim, in_dim in shapes_dict.values())
+            fixed_rank = max(1, target_budget // total_cost_per_rank)
+            print(f"Auto-computed fixed rank: {fixed_rank}")
+            print(f"  (based on {len(shapes_dict)} modules, cost per rank: {total_cost_per_rank:,})")
+        
+        # 为所有模块分配相同的秩，但需要确保不超过模块的最小维度
+        rank_allocation = {}
+        current_budget = 0
+        
+        for global_name, (out_dim, in_dim) in shapes_dict.items():
+            # 秩不能超过矩阵的最小维度
+            max_rank = min(out_dim, in_dim)
+            actual_rank = min(fixed_rank, max_rank)
+            rank_allocation[global_name] = actual_rank
+            current_budget += actual_rank * (out_dim + in_dim)
+        
+        # 统计
+        print(f"\nFixed rank applied: {fixed_rank}")
+        print(f"Allocated budget: {current_budget:,} ({current_budget/total_original_params:.2%})")
+        print(f"Budget error: {abs(current_budget - target_budget)/target_budget*100:.2f}%")
+        
+        # 打印每层分配示例
+        layer_ranks = {}
+        for name, rank in rank_allocation.items():
+            parts = name.split('.')
+            layer_idx = int(parts[0].replace('layer_', ''))
+            if layer_idx not in layer_ranks:
+                layer_ranks[layer_idx] = {}
+            module_name = '.'.join(parts[1:])
+            layer_ranks[layer_idx][module_name] = rank
+        
+        print(f"\nRank allocation per layer (fixed):")
+        for layer_idx in sorted(layer_ranks.keys())[:3]:
+            print(f"  Layer {layer_idx}: {layer_ranks[layer_idx]}")
+        if len(layer_ranks) > 3:
+            print(f"  ... ({len(layer_ranks) - 3} more layers with same fixed rank)")
+        
+        return rank_allocation
+
 
 class RecursiveErrorCompensator:
     """
     递归误差吸收器
     
-    利用下一层的 Hessian 逆信息，将当前层的截断误差压入下一层权重
+    利用白化矩阵信息，将当前层的截断误差压入下一层权重
     
     理论：
     Δ_l = W_l @ X - W'_l @ X  (当前层误差)
@@ -597,7 +438,6 @@ class RecursiveErrorCompensator:
     
     def __init__(self, damp: float = 0.01):
         self.damp = damp
-        self.fh_computer = FisherHessianComputer(damp)
     
     def compute_layer_error(self,
                             W_original: torch.Tensor,
@@ -651,9 +491,15 @@ class RecursiveErrorCompensator:
         device = W_next.device
         dtype = W_next.dtype
         
-        # 计算 Hessian 逆
+        # 计算 Hessian 逆（使用简单的阻尼逆）
         H_next = H_next.to(device).float()
-        H_inv = self.fh_computer.compute_inv_sqrt_matrix(H_next @ H_next)  # 近似 H^(-1)
+        n = H_next.size(0)
+        damp_val = max(self.damp * H_next.diag().abs().mean().item(), 1e-6)
+        H_damped = H_next + damp_val * torch.eye(n, device=device)
+        try:
+            H_inv = torch.linalg.inv(H_damped)
+        except:
+            H_inv = torch.linalg.pinv(H_damped)
         
         # 计算补偿量
         # Δ: [batch, seq, in_dim_next]
@@ -682,8 +528,8 @@ class CGSVRCompressor:
     C-GSVR 主压缩器
     
     完整流程:
-    1. 初始化与多维统计收集 (Hessian + Fisher)
-    2. 全局边际收益建模 (加权 SVD)
+    1. 收集白化矩阵 (SVD-LLM 风格，使用 Cholesky 分解)
+    2. 白化后 SVD 分解
     3. 严格压缩率约束下的秩分配 (贪心选择)
     4. 顺序压缩与跨层误差补偿
     5. 模型重构
@@ -693,21 +539,28 @@ class CGSVRCompressor:
                  damp: float = 0.01,
                  use_fisher: bool = True,
                  use_compensation: bool = False,
-                 compensation_strength: float = 0.1):
+                 compensation_strength: float = 0.1,
+                 fixed_rank: bool = False,
+                 fixed_rank_value: int = None):
         """
         Args:
             damp: 阻尼系数
-            use_fisher: 是否使用 Fisher 信息
+            use_fisher: 是否使用 Fisher 信息（保留参数，但现在使用 SVD-LLM 白化）
             use_compensation: 是否启用误差补偿
             compensation_strength: 误差补偿强度
+            fixed_rank: 是否使用固定秩（所有层使用相同的秩）
+            fixed_rank_value: 固定秩的值（仅当 fixed_rank=True 时使用）
         """
         self.damp = damp
         self.use_fisher = use_fisher
         self.use_compensation = use_compensation
         self.compensation_strength = compensation_strength
+        self.fixed_rank = fixed_rank
+        self.fixed_rank_value = fixed_rank_value
         
-        self.fh_computer = FisherHessianComputer(damp)
-        self.svd_computer = WeightedSVDComputer(damp, use_fisher)
+        # 使用 SVD-LLM 风格的白化
+        self.whitening_computer = WhiteningComputer(damp)
+        self.svd_computer = WhitenedSVDComputer(damp)
         self.rank_allocator = MarginalUtilityRankAllocator()
         self.error_compensator = RecursiveErrorCompensator(damp)
     
@@ -737,49 +590,48 @@ class CGSVRCompressor:
         print(f"{'='*70}")
         print(f"Model: {model_name}")
         print(f"Target ratio: {target_ratio:.2%}")
-        print(f"Use Fisher: {self.use_fisher}")
+        print(f"Whitening Method: SVD-LLM (Cholesky)")
         print(f"Use Compensation: {self.use_compensation}")
+        print(f"Rank Mode: {'Fixed' if self.fixed_rank else 'Variable (Marginal Utility)'}")
+        if self.fixed_rank and self.fixed_rank_value:
+            print(f"Fixed Rank Value: {self.fixed_rank_value}")
         if checkpoint_path:
             print(f"Checkpoint path: {checkpoint_path}")
             os.makedirs(checkpoint_path, exist_ok=True)
         print(f"{'='*70}\n")
         
-        # ========== Step 1: 收集统计信息 ==========
-        print(f"\n[Step 1/5] Collecting Statistics...")
+        # ========== Step 1: 收集白化矩阵 (SVD-LLM Style) ==========
+        print(f"\n[Step 1/5] Collecting Whitening Matrices (SVD-LLM Style)...")
         
+        scaling_mat = None
         stats_loaded = False
-        h_mat = None
-        f_mat = None
         
         if checkpoint_path:
-            stats_ckpt = os.path.join(checkpoint_path, "stats_checkpoint.pt")
+            stats_ckpt = os.path.join(checkpoint_path, "whitening_checkpoint.pt")
             if os.path.exists(stats_ckpt):
-                print(f"Loading statistics from {stats_ckpt}...")
+                print(f"Loading whitening matrices from {stats_ckpt}...")
                 try:
                     stats_data = torch.load(stats_ckpt, map_location='cpu')
-                    h_mat = stats_data['h_mat']
-                    f_mat = stats_data['f_mat']
+                    scaling_mat = stats_data['scaling_mat']
                     stats_loaded = True
-                    print("Statistics loaded successfully!")
+                    print("Whitening matrices loaded successfully!")
                 except Exception as e:
-                    print(f"Failed to load statistics: {e}")
+                    print(f"Failed to load whitening matrices: {e}")
         
         if not stats_loaded:
-            h_mat = self.fh_computer.collect_hessian(model, calib_loader, device, model_name)
-            
-            if self.use_fisher:
-                f_mat = self.fh_computer.collect_fisher(model, calib_loader, device, model_name)
+            scaling_mat = self.whitening_computer.collect_scaling_matrices(
+                model, calib_loader, device, model_name
+            )
             
             if checkpoint_path:
-                stats_ckpt = os.path.join(checkpoint_path, "stats_checkpoint.pt")
-                print(f"Saving statistics to {stats_ckpt}...")
+                stats_ckpt = os.path.join(checkpoint_path, "whitening_checkpoint.pt")
+                print(f"Saving whitening matrices to {stats_ckpt}...")
                 torch.save({
-                    'h_mat': h_mat,
-                    'f_mat': f_mat
+                    'scaling_mat': scaling_mat
                 }, stats_ckpt)
         
-        # ========== Step 2: 加权 SVD ==========
-        print(f"\n[Step 2/5] Computing Weighted SVD...")
+        # ========== Step 2: 白化后 SVD ==========
+        print(f"\n[Step 2/5] Computing Whitened SVD...")
         if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
             layers = model.model.layers
         elif "opt" in model_name:
@@ -790,12 +642,12 @@ class CGSVRCompressor:
         svd_loaded = False
         sigma_dict = {}
         shapes_dict = {}
-        svd_cache = {}  # {global_name: (U, S, Vt, H_sqrt, F_sqrt)}
+        svd_cache = {}  # {global_name: (U, S, Vt, scaling_matrix)}
         layer_module_map = {}
         total_original_params = 0
         
         if checkpoint_path:
-            svd_ckpt = os.path.join(checkpoint_path, "svd_checkpoint.pt")
+            svd_ckpt = os.path.join(checkpoint_path, "svd_whitened_checkpoint.pt")
             if os.path.exists(svd_ckpt):
                 print(f"Loading SVD results from {svd_ckpt}...")
                 try:
@@ -813,34 +665,31 @@ class CGSVRCompressor:
         if not svd_loaded:
             for i in tqdm(range(len(layers)), desc="SVD computation"):
                 layer = layers[i]
-                layer_h = h_mat[i]
-                layer_f = f_mat[i] if f_mat else {}
+                layer_scaling = scaling_mat[i]
                 
                 for name, module in layer.named_modules():
-                    if isinstance(module, nn.Linear) and name in layer_h:
+                    if isinstance(module, nn.Linear) and name in layer_scaling:
                         W = module.weight.data
-                        H = layer_h[name]
-                        F = layer_f.get(name, None)
+                        scaling_matrix = layer_scaling[name]
                         
                         global_name = f"layer_{i}.{name}"
                         
-                        # 执行加权 SVD
-                        U, S, Vt, H_sqrt, F_sqrt = self.svd_computer.weighted_svd(
-                            W, H, F, device
+                        # 执行白化后 SVD
+                        U, S, Vt, _ = self.svd_computer.whitened_svd(
+                            W, scaling_matrix, device
                         )
                         
                         # 保存结果
                         sigma_dict[global_name] = S.cpu()
                         shapes_dict[global_name] = W.shape
-                        svd_cache[global_name] = (U.cpu(), S.cpu(), Vt.cpu(), 
-                                                  H_sqrt.cpu(), F_sqrt.cpu())
+                        svd_cache[global_name] = (U.cpu(), S.cpu(), Vt.cpu())
                         layer_module_map[global_name] = (i, name)
                         total_original_params += W.numel()
                 
                 torch.cuda.empty_cache()
             
             if checkpoint_path:
-                svd_ckpt = os.path.join(checkpoint_path, "svd_checkpoint.pt")
+                svd_ckpt = os.path.join(checkpoint_path, "svd_whitened_checkpoint.pt")
                 print(f"Saving SVD results to {svd_ckpt}...")
                 torch.save({
                     'sigma_dict': sigma_dict,
@@ -852,12 +701,20 @@ class CGSVRCompressor:
         
         # ========== Step 3: 全局秩分配 ==========
         print(f"\n[Step 3/5] Global Rank Allocation...")
-        self.rank_allocator.build_global_utility_table(
-            sigma_dict, shapes_dict, layer_module_map
-        )
-        rank_allocation = self.rank_allocator.allocate_ranks(
-            total_original_params, target_ratio
-        )
+        
+        if self.fixed_rank:
+            # 固定秩模式：所有层使用相同的秩
+            rank_allocation = self.rank_allocator.allocate_fixed_ranks(
+                total_original_params, target_ratio, shapes_dict, self.fixed_rank_value
+            )
+        else:
+            # 可变秩模式：基于边际效用的自适应秩分配
+            self.rank_allocator.build_global_utility_table(
+                sigma_dict, shapes_dict, layer_module_map
+            )
+            rank_allocation = self.rank_allocator.allocate_ranks(
+                total_original_params, target_ratio
+            )
         
         # ========== Step 4: 顺序压缩与跨层误差补偿 ==========
         print(f"\n[Step 4/5] Sequential Compression & Cross-layer Compensation...")
@@ -899,28 +756,23 @@ class CGSVRCompressor:
                         rank = rank_allocation.get(global_name, 0)
                         
                         if rank > 0:
-                            U, S, Vt, H_sqrt, F_sqrt = svd_cache[global_name]
+                            # SVD-LLM 风格：SVD 已经在白化空间完成并逆变换回原始空间
+                            U, S, Vt = svd_cache[global_name]
                             W_original = module.weight.data.clone()
                             
                             # 截断到分配的秩
-                            U_trunc = U[:, :rank]
-                            S_trunc = S[:rank]
-                            Vt_trunc = Vt[:rank, :]
-                            
-                            # 逆变换到原始空间
-                            U_final, Vt_final = self.svd_computer.unweight_transform(
-                                U_trunc.to(device), Vt_trunc.to(device),
-                                H_sqrt.to(device), F_sqrt.to(device)
-                            )
+                            U_trunc = U[:, :rank].to(device)
+                            S_trunc = S[:rank].to(device)
+                            Vt_trunc = Vt[:rank, :].to(device)
                             
                             # 计算本层压缩误差（用于传递给下一层）
                             if self.use_compensation and i < len(layers) - 1:
-                                W_compressed = (U_final @ torch.diag(S_trunc.to(device))) @ Vt_final
+                                W_compressed = (U_trunc @ torch.diag(S_trunc)) @ Vt_trunc
                                 delta_W = W_original.to(device).float() - W_compressed
                                 layer_error[name] = delta_W.cpu()
                             
                             compressed_modules[global_name] = (
-                                U_final.cpu(), S_trunc.cpu(), Vt_final.cpu()
+                                U_trunc.cpu(), S_trunc.cpu(), Vt_trunc.cpu()
                             )
                         else:
                             compressed_modules[global_name] = None
@@ -932,11 +784,11 @@ class CGSVRCompressor:
                 # ===== 跨层误差补偿：将本层误差传递给下一层 =====
                 if self.use_compensation and i < len(layers) - 1 and layer_error:
                     next_layer = layers[i + 1]
-                    next_layer_h = h_mat.get(i + 1, {})
+                    next_layer_scaling = scaling_mat.get(i + 1, {})
                     
                     # 对下一层的权重进行补偿
-                    self._apply_error_compensation(
-                        next_layer, layer_error, next_layer_h, 
+                    self._apply_error_compensation_whitening(
+                        next_layer, layer_error, next_layer_scaling, 
                         layer_inputs.get(i + 1, None), device
                     )
                 
@@ -1089,6 +941,67 @@ class CGSVRCompressor:
                 compensation = self.compensation_strength * error_scale * (H_inv @ W.T).T
                 
                 # 应用补偿（限制补偿幅度）
+                max_change = 0.1 * W.abs().mean()
+                compensation = torch.clamp(compensation, -max_change, max_change)
+                
+                # 更新权重
+                module.weight.data = (W - compensation).to(module.weight.dtype)
+    
+    def _apply_error_compensation_whitening(self, next_layer, layer_error, next_layer_scaling, 
+                                             next_layer_input, device):
+        """
+        将当前层的误差补偿到下一层的权重 (SVD-LLM 白化版本)
+        
+        Args:
+            next_layer: 下一层模块
+            layer_error: 当前层各模块的权重误差 {name: delta_W}
+            next_layer_scaling: 下一层的白化矩阵字典
+            next_layer_input: 下一层的输入
+            device: 计算设备
+        """
+        if next_layer_input is None:
+            return
+        
+        # 计算当前层对输出的总体影响
+        key_modules = ['self_attn.o_proj', 'mlp.down_proj']
+        
+        total_error_effect = None
+        for key in key_modules:
+            for name, delta_W in layer_error.items():
+                if key.split('.')[-1] in name:
+                    if total_error_effect is None:
+                        total_error_effect = delta_W.to(device)
+                    else:
+                        if total_error_effect.shape == delta_W.shape:
+                            total_error_effect = total_error_effect + delta_W.to(device)
+        
+        if total_error_effect is None:
+            return
+        
+        # 对下一层的输入投影层进行补偿
+        input_layer_names = ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']
+        
+        for name, module in next_layer.named_modules():
+            if isinstance(module, nn.Linear) and any(n in name for n in input_layer_names):
+                scaling = next_layer_scaling.get(name, None)
+                if scaling is None:
+                    continue
+                
+                scaling = scaling.to(device).float()
+                W = module.weight.data.to(device).float()
+                
+                # 使用白化矩阵计算逆
+                try:
+                    scaling_inv = torch.linalg.inv(scaling)
+                    H_approx_inv = scaling_inv @ scaling_inv.T
+                except:
+                    H_approx_inv = torch.eye(scaling.shape[0], device=device)
+                
+                # 计算补偿量
+                error_scale = total_error_effect.norm() / (W.norm() + 1e-8)
+                compensation = self.compensation_strength * error_scale * (H_approx_inv @ W.T).T
+                
+                # 限制补偿幅度
                 max_change = 0.1 * W.abs().mean()
                 compensation = torch.clamp(compensation, -max_change, max_change)
                 
