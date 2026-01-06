@@ -1315,6 +1315,8 @@ if __name__ == '__main__':
             print(results) 
         if args.save_path is not None:
             args.save_path = args.save_path + '/' + args.model.split('/')[-1] +'_svdllm_' + args.trunc_rank_method + f'_matrices_optimized{args.matrices_optimized}_' + str(args.ratio)
+            if hasattr(model, "generation_config"):
+                model.generation_config.do_sample = True
             model.save_pretrained(args.save_path)
             tokenizer.save_pretrained(args.save_path)
     if args.step == -1:
